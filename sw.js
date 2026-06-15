@@ -1,71 +1,41 @@
-// Service worker: emulate Framer CDN byte-range serving for .framercms files.
-// Static hosts (GitHub Pages, python http.server) ignore the `?range=A-B` query
-// and return the whole file, which Framer rejects ("Unexpected response length").
-// We intercept those requests, fetch the full file, and return the exact byte slice.
+// Service worker: fallback byte-range emulation for .framercms files.
 //
-// We also swap the template's CMS card titles for Brittman ones on the fly. The
-// binary .framercms files are left untouched (so their byte offsets/lengths stay
-// valid); each replacement is padded with spaces to the SAME byte length as the
-// original, so slicing offsets are unaffected. HTML collapses the trailing spaces.
+// Framer requests CMS chunks as `file.framercms?range=A-B,C-D` and validates that
+// the response body length equals the sum of the requested ranges. Static hosts
+// (GitHub Pages) ignore the query and return the whole file, so Framer would
+// reject it ("Unexpected response length"). The CMS modules have been patched to
+// fetch the full file directly, so this worker is now only a safety net for any
+// other range request: it returns the exact concatenation of the requested
+// (inclusive) ranges. Handles both single and comma-separated multi-range.
 self.addEventListener('install', function(e){ self.skipWaiting(); });
 self.addEventListener('activate', function(e){ e.waitUntil(self.clients.claim()); });
-
-// old -> new (new is auto-padded with spaces to match old's byte length)
-var TITLE_SWAPS = {
-  // work collection
-  'ElevateCommerce':    'Temp Staffing',
-  'Orion Solutions':    'Turnkey Project',
-  'NexaTech':           'Repairs',
-  'Vertex Innovations': 'Regulatory',
-  // blog / media collection
-  'Designing a Visual Identity That Clicks':         'HT Shine HR Conclave, Mumbai',
-  'Plan First, Win Bigger: The Pre-Design Playbook': 'AIESEC Ahmedabad HR Summit 2014',
-  'Why Data-Driven Marketing Wins Every Time':       'Redefining Employability for Gen Y',
-  'Simple Strategies to Scale Your Business Faster': 'Complete Corporate Services',
-  'How a Strong Brand Builds Business Success':      'A Decade of Seamless Service'
-};
-
-var enc = new TextEncoder();
-var SWAPS = Object.keys(TITLE_SWAPS).map(function(oldStr){
-  var ob = enc.encode(oldStr);
-  var nb = enc.encode(TITLE_SWAPS[oldStr]);
-  if (nb.length > ob.length) return null;                 // safety: never grow
-  var padded = new Uint8Array(ob.length);
-  padded.fill(0x20);                                       // spaces
-  padded.set(nb, 0);
-  return { old: ob, neu: padded };
-}).filter(Boolean);
-
-function applySwaps(buf){
-  var bytes = new Uint8Array(buf);
-  for (var s = 0; s < SWAPS.length; s++){
-    var needle = SWAPS[s].old, repl = SWAPS[s].neu, n = needle.length;
-    for (var i = 0; i + n <= bytes.length; i++){
-      var hit = true;
-      for (var j = 0; j < n; j++){ if (bytes[i+j] !== needle[j]) { hit = false; break; } }
-      if (hit){ bytes.set(repl, i); i += n - 1; }
-    }
-  }
-  return bytes.buffer;
-}
-
 self.addEventListener('fetch', function(e){
   var url = e.request.url;
-  if (url.indexOf('.framercms') === -1) return;              // passthrough
-  var m = url.match(/[?&]range=(\d+)-(\d+)/);
-  if (!m) return;                                            // passthrough
-  var start = +m[1], end = +m[2];                            // Framer range: inclusive [start, end]
-  var full = url.replace(/([?&])range=\d+-\d+/, '$1').replace(/[?&]$/, '');
+  if (url.indexOf('.framercms') === -1) return;             // passthrough
+  var m = url.match(/[?&]range=([0-9,\-]+)/);
+  if (!m) return;                                           // no range -> passthrough
+  var ranges = m[1].split(',').map(function(p){
+    var a = p.split('-'); return [parseInt(a[0], 10), parseInt(a[1], 10)]; // inclusive [from, to]
+  });
+  var full = url.replace(/([?&])range=[0-9,\-]+/, '$1').replace(/[?&]$/, '');
   e.respondWith(
     fetch(full, { cache: 'force-cache' })
       .then(function(r){ return r.arrayBuffer(); })
       .then(function(buf){
-        var slice = applySwaps(buf).slice(start, end + 1);
-        return new Response(slice, {
+        var src = new Uint8Array(buf);
+        var total = 0, i;
+        for (i = 0; i < ranges.length; i++) total += ranges[i][1] - ranges[i][0] + 1;
+        var out = new Uint8Array(total), off = 0;
+        for (i = 0; i < ranges.length; i++){
+          var a = ranges[i][0], b = ranges[i][1];
+          out.set(src.subarray(a, b + 1), off);
+          off += b - a + 1;
+        }
+        return new Response(out, {
           status: 200,
           headers: {
             'Content-Type': 'application/octet-stream',
-            'Content-Length': String(slice.byteLength)
+            'Content-Length': String(out.byteLength)
           }
         });
       })
